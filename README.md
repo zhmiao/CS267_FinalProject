@@ -1,1 +1,1 @@
-# CS267_FinalProject
+# CS267_FinalProject: N-particle simulation comparison between CUDA and Unity

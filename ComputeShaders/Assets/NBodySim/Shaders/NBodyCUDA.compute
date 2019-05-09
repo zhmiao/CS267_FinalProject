@@ -1,0 +1,258 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+//#pragma target 5.0
+//#pragma target gl4.3
+#pragma kernel clear_bin_gpu
+#pragma kernel assign_particle_gpu
+#pragma kernel compute_forces_gpu
+#pragma kernel move_gpu
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+RWTexture2D<float4> Result;
+
+#define NUM_THREADS 256
+
+float density;
+float mass;
+float cutoff;
+float bin_size;                                                         //BIN SIZE DEFINED HERE, CHANGE MANUALLY
+float min_r;
+float dt;
+int count;
+
+float size;
+
+
+float4 _GroupDim, _ThreadDim;
+
+//clear_bin_gpu parameters
+int nbin_1d;
+RWStructuredBuffer<int> d_bin;						
+RWStructuredBuffer<float> d_bin_debug;											
+
+//assign_particle_gpu parameters
+int n;
+struct particle_t { 
+	double x;
+	double y;
+	double vx;
+	double vy;
+	double ax;
+	double ay;
+};
+RWStructuredBuffer<particle_t> d_particles;
+RWStructuredBuffer<int> d_particle_chain;
+
+[numthreads(16, 16, 1)]
+void clear_bin_gpu(int3 groupID : SV_GroupID, int3 threadID : SV_GroupThreadID)
+{
+	int tidx = threadID.x + groupID.x*16;
+	int tidy = threadID.y + groupID.y*16;
+
+	if (tidx < nbin_1d && tidy < nbin_1d) {
+		d_bin[tidx*nbin_1d + tidy] = -1;
+	}
+}
+
+[numthreads(256, 1, 1)]
+void assign_particle_gpu(int3 groupID : SV_GroupID, int3 threadID : SV_GroupThreadID)
+{
+	int tid = threadID.x + groupID.x * 256;
+	if (tid < n) {
+		
+		int nx = floor((float)(d_particles[tid].x / bin_size));
+		int ny = floor((float)(d_particles[tid].y / bin_size));
+		if (nx == nbin_1d)
+			nx--;
+		if (ny == nbin_1d) 
+			ny--;
+		d_particles[tid].ax = 0;
+		d_particles[tid].ay = 0;
+
+		InterlockedExchange(d_bin[nx*nbin_1d + ny], tid, d_particle_chain[tid]);
+	}
+}
+
+
+
+void apply_force_gpu(int tid, int i)
+{
+	d_bin_debug[0] = -1;
+	double dx = d_particles[i].x - d_particles[tid].x;
+	double dy = d_particles[i].y - d_particles[tid].y;
+	double r2 = dx * dx + dy * dy;
+	double cutoff_d = (double)cutoff;
+	d_bin_debug[tid] = r2;
+	if (r2 > cutoff_d*cutoff_d)
+		return;
+	d_bin_debug[tid] = -10;
+	r2 = (r2 > min_r*min_r) ? r2 : min_r * min_r;
+	double r = sqrt((float)r2);
+	
+	//
+	//  very simple short-range repulsive force
+	//
+	double coef = (1 - cutoff / r) / r2 / mass;
+	d_particles[tid].ax += coef * dx;
+	d_particles[tid].ay += coef * dy;
+	
+}
+
+
+[numthreads(256, 1, 1)]
+void compute_forces_gpu(int3 groupID : SV_GroupID, int3 threadID : SV_GroupThreadID)
+{
+	// Get thread (particle) ID
+	int tid = threadID.x + groupID.x * 256;
+	if (tid >= n) 
+		return;
+
+	int nx = floor((float)(d_particles[tid].x / bin_size));
+	int ny = floor((float)(d_particles[tid].y / bin_size));
+	if (nx == nbin_1d) 
+		nx--;
+	if (ny == nbin_1d) 
+		ny--;
+
+	// Iterate through the particles in the same bin
+	for (int i = d_bin[nx*nbin_1d + ny]; i != -1; i = d_particle_chain[i]) {
+		if (i != tid) {
+			apply_force_gpu(tid, i);
+		}
+	}
+	
+	// Iterate through the particles in neighboring bins
+	if (nx == 0 && ny == 0) {
+		for (int i1 = d_bin[(nx + 1)*nbin_1d + ny]; i1 != -1; i1 = d_particle_chain[i1]) 
+			apply_force_gpu(tid, i1);
+		for (int i2 = d_bin[nx*nbin_1d + ny + 1]; i2 != -1; i2 = d_particle_chain[i2]) 
+			apply_force_gpu(tid, i2);
+		for (int i3 = d_bin[(nx + 1)*nbin_1d + ny + 1]; i3 != -1; i3 = d_particle_chain[i3]) 
+			apply_force_gpu(tid, i3);
+	}
+	else if (nx == 0 && ny == nbin_1d - 1) {
+		for (int i4 = d_bin[(nx + 1)*nbin_1d + ny]; i4 != -1; i4 = d_particle_chain[i4]) 
+			apply_force_gpu(tid, i4);
+		for (int i5 = d_bin[nx*nbin_1d + ny - 1]; i5 != -1; i5 = d_particle_chain[i5]) 
+			apply_force_gpu(tid, i5);
+		for (int i6 = d_bin[(nx + 1)*nbin_1d + ny - 1]; i6 != -1; i6 = d_particle_chain[i6])
+			apply_force_gpu(tid, i6);
+	}
+	else if (nx == nbin_1d - 1 && ny == 0) {
+		for (int i7 = d_bin[(nx - 1)*nbin_1d + ny]; i7 != -1; i7 = d_particle_chain[i7]) 
+			apply_force_gpu(tid, i7);
+		for (int i8 = d_bin[nx*nbin_1d + ny + 1]; i8 != -1; i8 = d_particle_chain[i8]) 
+			apply_force_gpu(tid, i8);
+		for (int i9 = d_bin[(nx - 1)*nbin_1d + ny + 1]; i9 != -1; i9 = d_particle_chain[i9]) 
+			apply_force_gpu(tid, i9);
+	}
+	else if (nx == nbin_1d - 1 && ny == nbin_1d - 1) {
+		for (int i11 = d_bin[nx*nbin_1d + ny - 1]; i11 != -1; i11 = d_particle_chain[i11])
+			apply_force_gpu(tid, i11);
+		for (int i12 = d_bin[(nx - 1)*nbin_1d + ny]; i12 != -1; i12 = d_particle_chain[i12]) 
+			apply_force_gpu(tid, i12);
+		for (int i13 = d_bin[(nx - 1)*nbin_1d + ny - 1]; i13 != -1; i13 = d_particle_chain[i13]) 
+			apply_force_gpu(tid, i13);
+	}
+	else if (nx == 0) {
+		for (int i21 = d_bin[nx*nbin_1d + ny - 1]; i21 != -1; i21 = d_particle_chain[i21]) 
+			apply_force_gpu(tid, i21);
+		for (int i22 = d_bin[nx*nbin_1d + ny + 1]; i22 != -1; i22 = d_particle_chain[i22]) 
+			apply_force_gpu(tid, i22);
+		for (int i23 = d_bin[(nx + 1)*nbin_1d + ny - 1]; i23 != -1; i23 = d_particle_chain[i23])
+			apply_force_gpu(tid, i23);
+		for (int i24 = d_bin[(nx + 1)*nbin_1d + ny]; i24 != -1; i24 = d_particle_chain[i24]) 
+			apply_force_gpu(tid, i24);
+		for (int i25 = d_bin[(nx + 1)*nbin_1d + ny + 1]; i25 != -1; i25 = d_particle_chain[i25]) 
+			apply_force_gpu(tid, i25);
+	}
+	else if (nx == nbin_1d - 1) {
+		for (int i31 = d_bin[nx*nbin_1d + ny - 1]; i31 != -1; i31 = d_particle_chain[i31]) 
+			apply_force_gpu(tid, i31);
+		for (int i32 = d_bin[nx*nbin_1d + ny + 1]; i32 != -1; i32 = d_particle_chain[i32]) 
+			apply_force_gpu(tid, i32);
+		for (int i33 = d_bin[(nx - 1)*nbin_1d + ny - 1]; i33 != -1; i33 = d_particle_chain[i33]) 
+			apply_force_gpu(tid, i33);
+		for (int i34 = d_bin[(nx - 1)*nbin_1d + ny]; i34 != -1; i34 = d_particle_chain[i34])
+			apply_force_gpu(tid, i34);
+		for (int i35 = d_bin[(nx - 1)*nbin_1d + ny + 1]; i35 != -1; i35 = d_particle_chain[i35]) 
+			apply_force_gpu(tid, i35);
+	}
+	else if (ny == 0) {
+		for (int i41 = d_bin[(nx + 1)*nbin_1d + ny]; i41 != -1; i41 = d_particle_chain[i41]) 
+			apply_force_gpu(tid, i41);
+		for (int i42 = d_bin[(nx - 1)*nbin_1d + ny]; i42 != -1; i42 = d_particle_chain[i42]) 
+			apply_force_gpu(tid, i42);
+		for (int i43 = d_bin[(nx - 1)*nbin_1d + ny + 1]; i43 != -1; i43 = d_particle_chain[i43]) 
+			apply_force_gpu(tid, i43);
+		for (int i44 = d_bin[nx*nbin_1d + ny + 1]; i44 != -1; i44 = d_particle_chain[i44]) 
+			apply_force_gpu(tid, i44);
+		for (int i45 = d_bin[(nx + 1)*nbin_1d + ny + 1]; i45 != -1; i45 = d_particle_chain[i45]) 
+			apply_force_gpu(tid, i45);
+	}
+	else if (ny == nbin_1d - 1) {
+		for (int i53 = d_bin[(nx + 1)*nbin_1d + ny]; i53 != -1; i53 = d_particle_chain[i53]) 
+			apply_force_gpu(tid, i53);
+		for (int i54 = d_bin[(nx - 1)*nbin_1d + ny]; i54 != -1; i54 = d_particle_chain[i54]) 
+			apply_force_gpu(tid, i54);
+		for (int i55 = d_bin[(nx - 1)*nbin_1d + ny - 1]; i55 != -1; i55 = d_particle_chain[i55])
+			apply_force_gpu(tid, i55);
+		for (int i56 = d_bin[nx*nbin_1d + ny - 1]; i56 != -1; i56 = d_particle_chain[i56]) 
+			apply_force_gpu(tid, i56);
+		for (int i57 = d_bin[(nx + 1)*nbin_1d + ny - 1]; i57 != -1; i57 = d_particle_chain[i57]) 
+			apply_force_gpu(tid, i57);
+	}
+	else {
+		for (int i64 = d_bin[nx*nbin_1d + ny - 1]; i64 != -1; i64 = d_particle_chain[i64]) 
+			apply_force_gpu(tid, i64);
+		for (int i65 = d_bin[nx*nbin_1d + ny + 1]; i65 != -1; i65 = d_particle_chain[i65]) 
+			apply_force_gpu(tid, i65);
+		for (int i66 = d_bin[(nx - 1)*nbin_1d + ny - 1]; i66 != -1; i66 = d_particle_chain[i66]) 
+			apply_force_gpu(tid, i66);
+		for (int i67 = d_bin[(nx - 1)*nbin_1d + ny]; i67 != -1; i67 = d_particle_chain[i67]) 
+			apply_force_gpu(tid, i67);
+		for (int i68 = d_bin[(nx - 1)*nbin_1d + ny + 1]; i68 != -1; i68 = d_particle_chain[i68]) 
+			apply_force_gpu(tid, i68);
+		for (int i76 = d_bin[(nx + 1)*nbin_1d + ny - 1]; i76 != -1; i76 = d_particle_chain[i76]) 
+			apply_force_gpu(tid, i76);
+		for (int i77 = d_bin[(nx + 1)*nbin_1d + ny]; i77 != -1; i77 = d_particle_chain[i77]) 
+			apply_force_gpu(tid, i77);
+		for (int i78 = d_bin[(nx + 1)*nbin_1d + ny + 1]; i78 != -1; i78 = d_particle_chain[i78]) 
+			apply_force_gpu(tid, i78);
+	}
+	
+}
+
+
+[numthreads(256, 1, 1)]
+void move_gpu(int3 groupID : SV_GroupID, int3 threadID : SV_GroupThreadID)
+{
+	// Get thread (particle) ID
+	int tid = threadID.x + groupID.x * 256;
+	if (tid >= n) 
+		return;
+
+	//
+	//  slightly simplified Velocity Verlet integration
+	//  conserves energy better than explicit Euler method
+	//
+	d_particles[tid].vx += d_particles[tid].ax * dt;
+	d_particles[tid].vy += d_particles[tid].ay * dt;
+	d_particles[tid].x += d_particles[tid].vx * dt;
+	d_particles[tid].y += d_particles[tid].vy * dt;
+
+	//
+	//  bounce from walls
+	//
+	while (d_particles[tid].x < 0 || d_particles[tid].x > size)
+	{
+		d_particles[tid].x = d_particles[tid].x < 0 ? -(d_particles[tid].x) : 2 * size - d_particles[tid].x;
+		d_particles[tid].vx = -(d_particles[tid].vx);
+	}
+	while (d_particles[tid].y < 0 || d_particles[tid].y > size)
+	{
+		d_particles[tid].y = d_particles[tid].y < 0 ? -(d_particles[tid].y) : 2 * size - d_particles[tid].y;
+		d_particles[tid].vy = -(d_particles[tid].vy);
+	}
+
+}
